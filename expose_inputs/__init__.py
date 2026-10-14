@@ -84,6 +84,15 @@ ITEM_COLLECTIONS = {
 }
 
 
+def search_parent_panel_names(self, context, edit_text):
+    """Suggests the titles of the selected node groups as master panel names."""
+    titles = list(dict.fromkeys(get_node_title(n) for n in get_selected_node_groups(get_active_node_tree(context))))
+    # Blender highlights the first result, so lead with the typed text: Enter keeps it instead of a suggestion
+    if edit_text and edit_text not in titles:
+        return [edit_text, *titles]
+    return titles
+
+
 class GripExposeSettings(bpy.types.PropertyGroup):
     """Settings stored on the scene for the Expose Child Inputs panel"""
     use_parent_panel: BoolProperty(
@@ -96,6 +105,8 @@ class GripExposeSettings(bpy.types.PropertyGroup):
         name="Master Panel Name",
         description="Name of the master parent panel. Leave empty to use the active node group's name",
         default="",
+        search=search_parent_panel_names,
+        search_options={'SUGGESTION'},
     )
 
     use_sub_panels: BoolProperty(
