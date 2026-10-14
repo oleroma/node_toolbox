@@ -1,5 +1,5 @@
 import bpy
-from bpy.props import BoolProperty, StringProperty, PointerProperty
+from bpy.props import BoolProperty, FloatProperty, StringProperty, PointerProperty
 
 # Mapping from socket.type to valid NodeTreeInterface socket_type identifiers
 SOCKET_TYPE_MAP = {
@@ -44,6 +44,9 @@ CONSTANT_NODE_PROPS = {
     'FunctionNodeInputVector': 'vector',
     'FunctionNodeInputString': 'string',
 }
+
+# Nodes whose width isn't a plain node width: frames are sized by their content, reroutes have none
+WIDTHLESS_NODE_TYPES = {'NodeFrame', 'NodeReroute'}
 
 
 class GripExposeSettings(bpy.types.PropertyGroup):
@@ -101,6 +104,20 @@ class GripExposeSettings(bpy.types.PropertyGroup):
         name="Only Visible Sockets",
         description="Skip sockets that are hidden on the node",
         default=True,
+    )
+
+
+class GripToolboxSettings(bpy.types.PropertyGroup):
+    """Settings stored on the scene for the Toolbox panel"""
+    node_width: FloatProperty(
+        name="Node Width",
+        description="Width to give the selected nodes. Each node type clamps it to its own min/max",
+        default=140.0,
+        min=10.0,
+        soft_max=700.0,
+        step=1000,
+        precision=0,
+        subtype='PIXEL',
     )
 
 
@@ -816,10 +833,87 @@ class NODE_PT_grip_expose_panel(bpy.types.Panel):
             sub.operator("node.expose_child_inputs", text="Select Node Groups to Expose", icon='RESTRICT_SELECT_ON')
 
 
+# ---------------------------------------------------------------------------
+# Toolbox
+# ---------------------------------------------------------------------------
+
+def get_selected_sizable_nodes(tree):
+    """Selected nodes that have a settable width (everything but frames and reroutes)."""
+    if not tree or not hasattr(tree, 'nodes'):
+        return []
+    return [n for n in tree.nodes if n.select and n.bl_idname not in WIDTHLESS_NODE_TYPES]
+
+
+class NODE_OT_grip_set_node_width(bpy.types.Operator):
+    """Set the width of all selected nodes"""
+    bl_idname = "node.grip_set_node_width"
+    bl_label = "Set Node Width"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    width: FloatProperty(
+        name="Width",
+        default=140.0,
+        min=10.0,
+        soft_max=700.0,
+        step=1000,
+        precision=0,
+        subtype='PIXEL',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return bool(get_selected_sizable_nodes(get_active_node_tree(context)))
+
+    def execute(self, context):
+        nodes = get_selected_sizable_nodes(get_active_node_tree(context))
+        if not nodes:
+            self.report({'WARNING'}, "No nodes selected")
+            return {'CANCELLED'}
+
+        for node in nodes:
+            node.width = self.width
+
+        # Blender clamps the width to each node type's own min/max
+        clamped = sum(1 for n in nodes if abs(n.width - self.width) > 0.5)
+        clamped_info = f" ({clamped} clamped to their type's limits)" if clamped else ""
+        self.report({'INFO'}, f"Set width of {len(nodes)} node(s) to {self.width:g}{clamped_info}")
+        return {'FINISHED'}
+
+
+class NODE_PT_grip_toolbox_panel(bpy.types.Panel):
+    """Personal node tools in the Node Editor Sidebar (N > Grip)"""
+    bl_label = "Toolbox"
+    bl_idname = "NODE_PT_grip_toolbox_panel"
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "Grip"
+
+    def draw(self, context):
+        layout = self.layout
+        tree = get_active_node_tree(context)
+
+        if not tree:
+            layout.label(text="No active node tree open", icon='INFO')
+            return
+
+        settings = context.scene.grip_toolbox_settings
+
+        # Node width
+        width_box = layout.box()
+        width_box.label(text="Node Width:", icon='ARROW_LEFTRIGHT')
+        row = width_box.row(align=True)
+        row.prop(settings, "node_width", text="")
+        op = row.operator(NODE_OT_grip_set_node_width.bl_idname, text="Apply to Selected")
+        op.width = settings.node_width
+
+
 classes = (
     GripExposeSettings,
+    GripToolboxSettings,
     NODE_OT_expose_child_inputs,
+    NODE_OT_grip_set_node_width,
     NODE_PT_grip_expose_panel,
+    NODE_PT_grip_toolbox_panel,
 )
 
 
@@ -831,14 +925,16 @@ def register():
         except Exception:
             pass
     bpy.types.Scene.grip_expose_settings = PointerProperty(type=GripExposeSettings)
+    bpy.types.Scene.grip_toolbox_settings = PointerProperty(type=GripToolboxSettings)
 
 
 def unregister():
-    if hasattr(bpy.types.Scene, 'grip_expose_settings'):
-        try:
-            del bpy.types.Scene.grip_expose_settings
-        except Exception:
-            pass
+    for prop in ('grip_expose_settings', 'grip_toolbox_settings'):
+        if hasattr(bpy.types.Scene, prop):
+            try:
+                delattr(bpy.types.Scene, prop)
+            except Exception:
+                pass
     for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)
