@@ -87,7 +87,10 @@ class GripExposeSettings(bpy.types.PropertyGroup):
 
     skip_linked: BoolProperty(
         name="Skip Linked Sockets",
-        description="Only expose inputs that are not already wired",
+        description=(
+            "Only expose inputs that are not wired to other nodes. Inputs already fed by the Group Input "
+            "are always skipped, so re-running only adds what's missing"
+        ),
         default=True,
     )
 
@@ -197,14 +200,33 @@ def get_panel_socket_identifiers(panel):
     return identifiers
 
 
-def panel_feeds_node(tree, panel, node):
-    """True if a socket in panel is already wired from a Group Input into node, i.e. the panel was made for it."""
-    identifiers = get_panel_socket_identifiers(panel)
+def get_input_consumers(tree):
+    """Maps interface input identifiers to the (node, input socket) pairs their Group Input outputs feed,
+    following reroutes."""
+    links_from = {}
+    for link in tree.links:
+        links_from.setdefault(link.from_node.name, []).append(link)
+    consumers = {}
+    for gin in tree.nodes:
+        if gin.bl_idname != 'NodeGroupInput':
+            continue
+        for first in links_from.get(gin.name, ()):
+            stack = [first]
+            while stack:
+                link = stack.pop()
+                if link.to_node.bl_idname == 'NodeReroute':
+                    stack.extend(links_from.get(link.to_node.name, ()))
+                else:
+                    consumers.setdefault(first.from_socket.identifier, []).append((link.to_node, link.to_socket))
+    return consumers
+
+
+def panel_feeds_node(panel, node, consumers):
+    """True if a socket in panel already feeds node from a Group Input, i.e. the panel was made for it."""
     return any(
-        link.from_node.bl_idname == 'NodeGroupInput'
-        and link.from_socket.identifier in identifiers
-        and link.to_node.name == node.name
-        for link in tree.links
+        target.name == node.name
+        for identifier in get_panel_socket_identifiers(panel)
+        for target, _ in consumers.get(identifier, ())
     )
 
 
@@ -230,7 +252,7 @@ def get_sibling_panels(tree, parent_panel):
     ]
 
 
-def find_sub_panel(tree, sub_panel_name, parent_panel=None, node=None, index_duplicates=False):
+def find_sub_panel(tree, sub_panel_name, parent_panel, node, consumers, index_duplicates=False):
     """Returns the existing panel in parent_panel to reuse for sub_panel_name, or None.
     With index_duplicates, only a panel made for node counts (same name or an indexed variant of it)."""
     prefix = sub_panel_name + "."
@@ -239,16 +261,16 @@ def find_sub_panel(tree, sub_panel_name, parent_panel=None, node=None, index_dup
             if item.name == sub_panel_name:
                 return item
         elif (item.name == sub_panel_name or (item.name.startswith(prefix) and item.name[len(prefix):].isdigit())) \
-                and node is not None and panel_feeds_node(tree, item, node):
+                and panel_feeds_node(item, node, consumers):
             return item
     return None
 
 
-def get_or_create_sub_panel(tree, sub_panel_name, parent_panel=None, node=None, index_duplicates=False, template=None):
+def get_or_create_sub_panel(tree, sub_panel_name, parent_panel, node, consumers, index_duplicates=False, template=None):
     """Finds or creates a sub-panel, nesting it inside parent_panel if provided."""
     if not sub_panel_name:
         return parent_panel
-    panel = find_sub_panel(tree, sub_panel_name, parent_panel, node, index_duplicates)
+    panel = find_sub_panel(tree, sub_panel_name, parent_panel, node, consumers, index_duplicates)
     if panel is None:
         panel = create_sub_panel(tree, sub_panel_name, parent_panel, index_duplicates, template)
     return panel
@@ -279,47 +301,88 @@ def create_sub_panel(tree, sub_panel_name, parent_panel=None, index_duplicates=F
         return parent_panel
 
 
-def get_exposed_inputs(tree, node):
-    """Maps node's input identifiers to the interface sockets already wired into them from a Group Input."""
-    interface_sockets = {
-        item.identifier: item for item in tree.interface.items_tree
-        if item.item_type == 'SOCKET' and item.in_out == 'INPUT'
-    }
-    return {
-        link.to_socket.identifier: interface_sockets[link.from_socket.identifier]
-        for link in tree.links
-        if link.to_node.name == node.name and link.from_node.bl_idname == 'NodeGroupInput'
-        and link.from_socket.identifier in interface_sockets
-    }
+def is_inside(item, panel):
+    """True if item sits anywhere inside panel (None = anywhere in the interface)."""
+    if panel is None:
+        return True
+    parent = item.parent
+    while not is_root_panel(parent):
+        if parent == panel:
+            return True
+        parent = parent.parent
+    return False
 
 
-def find_exposed_counterpart(tree, child_item, parent, node, exposed, index_duplicates):
-    """Returns the item inside parent that was exposed from child_item (a socket or panel of node's group), or None."""
-    if child_item.item_type == 'PANEL':
-        return find_sub_panel(tree, child_item.name, parent, node, index_duplicates)
-    other = exposed.get(child_item.identifier)
-    return other if other is not None and other.parent == parent else None
-
-
-def place_like_source(tree, item, child_item, node, exposed, index_duplicates):
-    """Moves a newly exposed item right after the exposed copy of the nearest earlier item in the child group
-    (or before the nearest later one), so inputs added to a child later keep its order instead of being appended.
-    Blender always keeps sockets above sub-panels, so only items of the same kind serve as anchors."""
-    siblings = [
-        i for i in child_item.parent.interface_items
-        if i.item_type == child_item.item_type and not (i.item_type == 'SOCKET' and i.in_out == 'OUTPUT')
-    ]
+def find_exposed_neighbour(tree, child_item, node, consumers, within):
+    """Returns the exposed socket of the nearest earlier (else later) input next to child_item in node's group,
+    searched inside within (None = top level, where only sockets named like their input count), or None.
+    New inputs join their neighbours there, whatever layout those were exposed with."""
+    interface_sockets = {i.identifier: i for i in tree.interface.items_tree if i.item_type == 'SOCKET'}
+    exposed = {}  # node input identifier -> interface socket feeding it
+    for identifier, targets in consumers.items():
+        for target, sock in targets:
+            if target.name == node.name and identifier in interface_sockets:
+                exposed.setdefault(sock.identifier, interface_sockets[identifier])
+    siblings = [i for i in child_item.parent.interface_items if i.item_type == 'SOCKET' and i.in_out == 'INPUT']
     index = next(k for k, i in enumerate(siblings) if i == child_item)
-    for sibling in reversed(siblings[:index]):
-        other = find_exposed_counterpart(tree, sibling, item.parent, node, exposed, index_duplicates)
-        if other is not None:
-            tree.interface.move(item, other.position + 1)
-            return
-    for sibling in siblings[index + 1:]:
-        other = find_exposed_counterpart(tree, sibling, item.parent, node, exposed, index_duplicates)
-        if other is not None:
-            tree.interface.move(item, other.position)
-            return
+    for sibling in list(reversed(siblings[:index])) + siblings[index + 1:]:
+        other = exposed.get(sibling.identifier)
+        if other is not None and is_inside(other, within) and (within is not None or other.name == sibling.name):
+            return other
+    return None
+
+
+def get_source_order(node, socket, cache):
+    """Sort key placing a node input by its node's position (top-to-bottom, then left-to-right) and then by the
+    input's position inside the node's group."""
+    if node.name not in cache:
+        items = node.node_tree.interface.items_tree if getattr(node, 'node_tree', None) else node.inputs
+        cache[node.name] = {item.identifier: i for i, item in enumerate(items)}
+    x, y = get_node_visual_pos(node)
+    return (-y, x, node.name, cache[node.name].get(socket.identifier, 0))
+
+
+def sort_exposed_items(tree, container, consumers):
+    """Reorders the exposed sockets and panels inside container (None = top level), recursively, into source order:
+    the nodes they feed top-to-bottom, then each node's own input order. Items feeding no node keep their place.
+    At top level only sockets named like the input they feed count, so the group's own inputs stay put.
+    Returns the number of items moved."""
+    strict = container is None
+    cache = {}
+
+    def item_key(item):
+        if item.item_type == 'PANEL':
+            keys = [key for key in map(item_key, item.interface_items) if key is not None]
+            return min(keys) if keys else None
+        if item.in_out != 'INPUT':
+            return None
+        keys = [
+            get_source_order(node, sock, cache) for node, sock in consumers.get(item.identifier, ())
+            if node.bl_idname != 'NodeGroupOutput' and (not strict or sock.name == item.name)
+        ]
+        return min(keys) if keys else None
+
+    def sort_level(items):
+        desired = list(items)
+        # Blender keeps sockets above panels, so each kind is sorted within the slots it already occupies
+        for kind in ('SOCKET', 'PANEL'):
+            managed = [(item_key(i), pos) for pos, i in enumerate(items) if i.item_type == kind]
+            managed = [(key, pos) for key, pos in managed if key is not None]
+            for slot, (_, pos) in zip([pos for _, pos in managed], sorted(managed)):
+                desired[slot] = items[pos]
+        moved = 0
+        for target, item in enumerate(desired):
+            if item.position != target:
+                tree.interface.move(item, target)
+                moved += 1
+        for item in desired:
+            if item.item_type == 'PANEL':
+                moved += sort_level(list(item.interface_items))
+        return moved
+
+    top = [i for i in tree.interface.items_tree if is_child_of(i, None)] if container is None \
+        else list(container.interface_items)
+    return sort_level(top)
 
 
 def get_or_create_group_input(tree, target_nodes, force_new=False):
@@ -642,6 +705,7 @@ class NODE_OT_expose_child_inputs(bpy.types.Operator):
         extracted = {}      # source socket pointer -> (source output socket, interface socket item)
         nodes_to_move = {}  # name -> node: everything upstream of the extracted sources
         passed_reroutes = set()  # reroutes between sources and inputs; removed if left dangling
+        consumers = get_input_consumers(tree)  # which exposed socket feeds which node input; kept up to date below
 
         for node in selected_nodes:
             sub_panel_name = ""
@@ -654,9 +718,8 @@ class NODE_OT_expose_child_inputs(bpy.types.Operator):
                     sub_panel_name = node.name
 
             target_panel = get_or_create_sub_panel(
-                tree, sub_panel_name, parent_panel, node, self.index_duplicate_panels
+                tree, sub_panel_name, parent_panel, node, consumers, self.index_duplicate_panels
             ) if self.use_sub_panels else parent_panel
-            exposed = get_exposed_inputs(tree, node)  # from earlier runs; used to slot new sockets in source order
 
             node_had_exposure = False
             for inp in node.inputs:
@@ -664,16 +727,16 @@ class NODE_OT_expose_child_inputs(bpy.types.Operator):
                     continue
                 if hasattr(inp, 'enabled') and not inp.enabled:
                     continue
+                # Already exposed (or fed by one of the group's own inputs): never expose it twice
+                if inp.links and resolve_source_socket(inp.links[0])[0].node.bl_idname == 'NodeGroupInput':
+                    continue
 
                 source = None
                 if instances and inp.links and not inp.is_multi_input:
                     source, reroutes = resolve_source_socket(inp.links[0])
                     upstream = collect_upstream_nodes(source.node)
-                    # Leave alone inputs already fed by the group's own inputs, wiring between selected
-                    # nodes, and zones (their input/output pair can't be split)
-                    if source.node.bl_idname == 'NodeGroupInput' or any(
-                        name in selected_names or name in zone_names for name in upstream
-                    ):
+                    # Leave alone wiring between selected nodes, and zones (their input/output pair can't be split)
+                    if any(name in selected_names or name in zone_names for name in upstream):
                         source = None
 
                 if source is None and self.skip_linked and inp.is_linked:
@@ -686,17 +749,19 @@ class NODE_OT_expose_child_inputs(bpy.types.Operator):
                     passed_reroutes.update(reroutes)
                 is_new_socket = not (source and source.as_pointer() in extracted)
                 if is_new_socket:
-                    # Recreate the child group's own panels (outermost first) so its structure carries over
                     socket_panel = target_panel
                     child_item = find_interface_input(node.node_tree, inp.identifier) if getattr(node, 'node_tree', None) else None
-                    for child_panel in (get_panel_path(child_item) if child_item else []):
-                        panel = find_sub_panel(tree, child_panel.name, socket_panel, node, self.index_duplicate_panels)
-                        if panel is None:
-                            panel = create_sub_panel(
-                                tree, child_panel.name, socket_panel, self.index_duplicate_panels, child_panel
+                    neighbour = find_exposed_neighbour(tree, child_item, node, consumers, target_panel) if child_item else None
+                    if neighbour is not None:
+                        # Join the inputs next to it in the source, wherever (and however nested) they were exposed
+                        socket_panel = None if is_root_panel(neighbour.parent) else neighbour.parent
+                    else:
+                        # Recreate the child group's own panels (outermost first) so its structure carries over
+                        for child_panel in (get_panel_path(child_item) if child_item else []):
+                            socket_panel = get_or_create_sub_panel(
+                                tree, child_panel.name, socket_panel, node, consumers, self.index_duplicate_panels,
+                                child_panel,
                             )
-                            place_like_source(tree, panel, child_panel, node, exposed, self.index_duplicate_panels)
-                        socket_panel = panel
 
                     sock_item = tree.interface.new_socket(
                         name=socket_name,
@@ -711,7 +776,7 @@ class NODE_OT_expose_child_inputs(bpy.types.Operator):
                 gin_output = gin.outputs.get(sock_item.identifier)
                 if gin_output:
                     tree.links.new(gin_output, inp)
-                    exposed[inp.identifier] = sock_item
+                    consumers.setdefault(sock_item.identifier, []).append((node, inp))
                     connected_count += 1
                     node_had_exposure = True
 
@@ -726,8 +791,6 @@ class NODE_OT_expose_child_inputs(bpy.types.Operator):
                         extracted[source.as_pointer()] = (source, sock_item)
                         nodes_to_move.update(upstream)
                     sync_socket_value_to_instances(tree, sock_item)
-                    if child_item:
-                        place_like_source(tree, sock_item, child_item, node, exposed, self.index_duplicate_panels)
 
             if node_had_exposure:
                 nodes_processed += 1
@@ -757,10 +820,15 @@ class NODE_OT_expose_child_inputs(bpy.types.Operator):
             report_type = {'WARNING'}
             moved_info = f" '{tree.name}' has no instances to move linked nodes next to, so they were left inside."
 
+        # Put new and existing exposed items in source order: nodes top-to-bottom, then each node's input order
+        reordered = sort_exposed_items(tree, parent_panel, get_input_consumers(tree))
+        order_info = f" Reordered {reordered} item(s) to match the source." if reordered else ""
+
         parent_info = f" inside master panel '{parent_panel.name}'" if parent_panel else ""
         self.report(
             report_type,
-            f"Exposed {connected_count} socket(s) from {nodes_processed} node group(s){parent_info}.{moved_info}"
+            f"Exposed {connected_count} socket(s) from {nodes_processed} node group(s){parent_info}."
+            f"{moved_info}{order_info}"
         )
         return {'FINISHED'}
 
