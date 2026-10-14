@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "expose_inputs"
+version = "1.0.0"
+name = "Expose Child Inputs"
+tagline = "Expose child group inputs to Group Input with nested panels"
+maintainer = "Ai and me"
+type = "add-on"
+
+tags = ["Node", "Geometry Nodes"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
