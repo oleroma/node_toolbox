@@ -169,6 +169,11 @@ class GripToolboxSettings(bpy.types.PropertyGroup):
         precision=0,
         subtype='PIXEL',
     )
+    show_group_users: BoolProperty(
+        name="Show Group Users",
+        description="List the users of the selected node group. Turn off to skip scanning the file on every redraw",
+        default=True,
+    )
 
 
 def get_active_node_tree(context):
@@ -1444,6 +1449,133 @@ class NODE_PT_grip_toolbox_panel(bpy.types.Panel):
         op.width = settings.node_width
 
 
+# ---------------------------------------------------------------------------
+# Group Users
+# ---------------------------------------------------------------------------
+
+# Data-blocks that keep their own (embedded) node tree: (bpy.data collection, category, icon)
+EMBEDDED_TREE_OWNERS = (
+    ('materials', "Materials", 'MATERIAL'),
+    ('worlds', "Worlds", 'WORLD'),
+    ('lights', "Lights", 'LIGHT'),
+    ('textures', "Textures", 'TEXTURE'),
+    ('linestyles', "Line Styles", 'LINE_DATA'),
+    ('scenes', "Compositor", 'SCENE_DATA'),  # scene.node_tree exists before Blender 5.0
+)
+
+
+def get_inspected_group(tree):
+    """The node group to list users of: the active selected group node's group, else the only
+    selected group node's group, else the group being edited. Returns (group, from_selection)."""
+    active = tree.nodes.active
+    if active and active.select and getattr(active, 'node_tree', None):
+        return active.node_tree, True
+    groups = {n.node_tree for n in tree.nodes if n.select and getattr(n, 'node_tree', None)}
+    if len(groups) == 1:
+        return groups.pop(), True
+    if not tree.is_embedded_data:
+        return tree, False
+    return None, False
+
+
+def count_group_nodes(tree, group):
+    return sum(1 for n in tree.nodes if getattr(n, 'node_tree', None) == group)
+
+
+def find_group_users(group):
+    """Returns {category: [(icon, data-block, detail)]} for everything in the file that uses group."""
+    users = {}
+
+    def add(category, icon, owner, detail):
+        users.setdefault(category, []).append((icon, owner, detail))
+
+    def nodes_detail(count):
+        return f"{count} node{'s' if count != 1 else ''}"
+
+    for ng in bpy.data.node_groups:
+        count = count_group_nodes(ng, group)
+        if count:
+            add("Node Groups", 'NODETREE', ng, nodes_detail(count))
+
+    for attr, category, icon in EMBEDDED_TREE_OWNERS:
+        for owner in getattr(bpy.data, attr):
+            tree = getattr(owner, 'node_tree', None)
+            if tree and tree.is_embedded_data:
+                count = count_group_nodes(tree, group)
+                if count:
+                    add(category, icon, owner, nodes_detail(count))
+
+    for scene in bpy.data.scenes:
+        if getattr(scene, 'compositing_node_group', None) == group:  # Blender 5.0+
+            add("Compositor", 'SCENE_DATA', scene, "Compositor")
+
+    for ob in bpy.data.objects:
+        for md in ob.modifiers:
+            if md.type == 'NODES' and md.node_group == group:
+                add("Modifiers", 'GEOMETRY_NODES', ob, md.name)
+
+    return users
+
+
+class NODE_PT_grip_users_panel(bpy.types.Panel):
+    """Everything in the file that uses the selected node group (N > Grip)"""
+    bl_label = "Group Users"
+    bl_idname = "NODE_PT_grip_users_panel"
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "Grip"
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.grip_toolbox_settings, "show_group_users", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        tree = get_active_node_tree(context)
+
+        if not tree:
+            layout.label(text="No active node tree open", icon='INFO')
+            return
+
+        if not context.scene.grip_toolbox_settings.show_group_users:
+            layout.label(text="Preview disabled", icon='HIDE_ON')
+            return
+
+        group, from_selection = get_inspected_group(tree)
+        if not group:
+            layout.label(text="Select a group node", icon='INFO')
+            return
+
+        row = layout.row()
+        row.label(text=group.name, icon='NODETREE')
+        sub = row.row(align=True)
+        sub.alignment = 'RIGHT'
+        if group.library:
+            sub.label(text="", icon='LINKED')
+        sub.prop(group, "use_fake_user", text="", emboss=False)
+        if not from_selection:
+            layout.label(text="Edited group (no group node selected)", icon='INFO')
+
+        users = find_group_users(group)
+        if not users:
+            if group.use_fake_user:
+                layout.label(text="No users, kept by fake user", icon='FAKE_USER_ON')
+            else:
+                draw_wrapped(layout, context, "No users, will be lost when the file is saved", 'ERROR')
+            return
+
+        for category, entries in users.items():
+            box = layout.box()
+            box.label(text=f"{category} ({len(entries)})")
+            col = box.column(align=True)
+            for icon, owner, detail in entries:
+                row = col.row()
+                name = f"{owner.name} (this tree)" if owner == tree else owner.name
+                row.label(text=name, icon=icon)
+                sub = row.row()
+                sub.alignment = 'RIGHT'
+                sub.label(text=detail, icon='LINKED' if owner.library else 'NONE')
+
+
 classes = (
     GripExposeSettings,
     GripToolboxSettings,
@@ -1453,6 +1585,7 @@ classes = (
     NODE_PT_grip_expose_panel,
     NODE_PT_grip_reorder_panel,
     NODE_PT_grip_toolbox_panel,
+    NODE_PT_grip_users_panel,
 )
 
 
