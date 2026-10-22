@@ -1,1 +1,4 @@
 *.pyc
+
+# Everything made by building, testing or running the program
+/build/
